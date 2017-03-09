@@ -16,16 +16,28 @@
 #      specific language governing permissions and limitations
 #      under the License.
 #
+
 """
 Module containing the base Binding class and other service objects.
 """
-from exceptions import CmisException, RuntimeException, \
+from cmislib.exceptions import CmisException, RuntimeException, \
     ObjectNotFoundException, InvalidArgumentException, \
     PermissionDeniedException, NotSupportedException, \
     UpdateConflictException
 
+
 class Binding(object):
-    def getRepositoryService():
+
+    """
+    Represents the binding used to communicate with the CMIS server.
+    """
+
+    def getRepositoryService(self):
+
+        """
+        Returns the repository service specific to this binding.
+        """
+
         pass
 
     def _processCommonErrors(self, error, url):
@@ -50,11 +62,28 @@ class Binding(object):
             raise UpdateConflictException(error['status'], url)
         elif error['status'] == '500':
             raise RuntimeException(error['status'], url)
+        else:
+            raise CmisException(error['status'], url)
 
 
 class RepositoryServiceIfc(object):
-    def getRepositories():
+
+    """
+    Defines the interface for the repository service.
+    """
+
+    def getRepositories(self, client):
+
+        """
+        Returns a list of repositories for this server.
+        """
+
         pass
 
-    def getRepositoryInfo():
+    def getRepositoryInfo(self):
+
+        """
+        Returns the repository information for this server.
+        """
+
         pass

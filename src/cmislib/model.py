@@ -21,10 +21,11 @@ Module containing the CmisClient object, which is responsible for
 keeping track of connection information. The name 'model' is no longer
 really appropriate, but it is kept for backwards compatibility.
 """
-from atompub_binding import AtomPubBinding
-from cmis_services import Binding
-from domain import CmisObject, Repository
 import logging
+
+from cmislib.atompub.binding import AtomPubBinding
+from cmislib.cmis_services import Binding
+
 
 moduleLogger = logging.getLogger('cmislib.model')
 
@@ -49,7 +50,7 @@ class CmisClient(object):
         self.username = username
         self.password = password
         self.extArgs = kwargs
-        if (kwargs.has_key('binding') and (isinstance(kwargs['binding'], Binding))):
+        if 'binding' in kwargs and (isinstance(kwargs['binding'], Binding)):
             self.binding = kwargs['binding']
         else:
             self.binding = AtomPubBinding(**kwargs)
@@ -97,7 +98,6 @@ class CmisClient(object):
         """
 
         return self.binding.getRepositoryService().getDefaultRepository(self)
-
 
     defaultRepository = property(getDefaultRepository)
     repositories = property(getRepositories)

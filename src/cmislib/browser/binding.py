@@ -17,23 +17,170 @@
 #      under the License.
 #
 """
-Module containing the domain objects used to work with a CMIS provider.
+Module containing the browser binding-specific objects used to work with a CMIS
+provider.
 """
+from cmislib.cmis_services import Binding, RepositoryServiceIfc
+from cmislib.domain import CmisId, CmisObject, ObjectType, ACL, ACE, ChangeEntry
+from cmislib.exceptions import CmisException, InvalidArgumentException,\
+                               NotSupportedException, ObjectNotFoundException
+from cmislib.net import RESTService as Rest
+from cmislib.util import parsePropValueByType
+import json
 import logging
+import StringIO
+import time
+from urllib import urlencode, quote
 
-moduleLogger = logging.getLogger('cmislib.domain')
+CMIS_FORM_TYPE = 'application/x-www-form-urlencoded;charset=utf-8'
+
+moduleLogger = logging.getLogger('cmislib.browser.binding')
 
 
-class CmisObject(object):
+class BrowserBinding(Binding):
+
+    """
+    Implements the Browser Binding to communicate with the CMIS server. The
+    Browser Binding uses only GET and POST. It sends JSON and HTML forms and
+    gets back JSON.
+    """
+
+    def __init__(self, **kwargs):
+        self.extArgs = kwargs
+
+    def getRepositoryService(self):
+        return RepositoryService()
+
+    def get(self, url, username, password, **kwargs):
+
+        """
+        Does a get against the CMIS service. More than likely, you will not
+        need to call this method. Instead, let the other objects do it for you.
+
+        For example, if you need to get a specific object by object id, try
+        :class:`Repository.getObject`. If you have a path instead of an object
+        id, use :class:`Repository.getObjectByPath`. Or, you could start with
+        the root folder (:class:`Repository.getRootFolder`) and drill down from
+        there.
+        """
+
+        # merge the cmis client extended args with the ones that got passed in
+        if len(self.extArgs) > 0:
+            kwargs.update(self.extArgs)
+
+        resp, content = Rest().get(url,
+                                   username=username,
+                                   password=password,
+                                   **kwargs)
+        result = None
+        if resp['status'] != '200':
+            self._processCommonErrors(resp, url)
+        else:
+            result = json.loads(content)
+        return result
+
+    def post(self, url, payload, contentType, username, password, **kwargs):
+
+        """
+        Does a post against the CMIS service. More than likely, you will not
+        need to call this method. Instead, let the other objects do it for you.
+
+        For example, to update the properties on an object, you'd call
+        :class:`CmisObject.updateProperties`. Or, to check in a document that's
+        been checked out, you'd call :class:`Document.checkin` on the PWC.
+        """
+
+        # merge the cmis client extended args with the ones that got passed in
+        if len(self.extArgs) > 0:
+            kwargs.update(self.extArgs)
+
+        result = None
+        resp, content = Rest().post(url,
+                                    payload,
+                                    contentType,
+                                    username=username,
+                                    password=password,
+                                    **kwargs)
+        if resp['status'] != '200' and resp['status'] != '201':
+            self._processCommonErrors(resp, url)
+        elif content is not None and content != "":
+            result = json.loads(content)
+        return result
+
+
+class RepositoryService(RepositoryServiceIfc):
+
+    """
+    Defines the repository service for the Browser Binding.
+    """
+
+    def getRepository(self, client, repositoryId):
+        result = client.binding.get(client.repositoryUrl, client.username, client.password, **client.extArgs)
+
+        if repositoryId in result:
+            return BrowserRepository(client, result[repositoryId])
+
+        raise ObjectNotFoundException(url=client.repositoryUrl)
+
+    def getRepositories(self, client):
+        result = client.binding.get(client.repositoryUrl, client.username, client.password, **client.extArgs)
+
+        repositories = []
+        for repo in result.itervalues():
+            repositories.append({'repositoryId': repo['repositoryId'],
+                                 'repositoryName': repo['repositoryName']})
+        return repositories
+
+    def getDefaultRepository(self, client):
+
+        """
+        Gets the default repository for this server. The spec doesn't include
+        the notion of a default, so this just returns the first one in the
+        list.
+        """
+
+        result = client.binding.get(client.repositoryUrl, client.username, client.password, **client.extArgs)
+        # instantiate a Repository object with the first workspace
+        # element we find
+        repository = None
+        for repo in result.itervalues():
+            repository = BrowserRepository(client, repo)
+        return repository
+
+
+class BrowserCmisObject(object):
 
     """
     Common ancestor class for other CMIS domain objects such as
     :class:`Document` and :class:`Folder`.
     """
 
+    def __init__(self, cmisClient, repository, objectId=None, data=None, **kwargs):
+        """ Constructor """
+        self._cmisClient = cmisClient
+        self._repository = repository
+        self._objectId = objectId
+        self._properties = {}
+        self._allowableActions = {}
+        self.data = data
+        self._extArgs = kwargs
+        self.logger = logging.getLogger('cmislib.browser.binding.BrowserCmisObject')
+        self.logger.info('Creating an instance of CmisObject')
+
     def __str__(self):
         """To string"""
         return self.getObjectId()
+
+    def _initData(self):
+
+        """
+        An internal method used to clear out any member variables that
+        might be out of sync if we were to fetch new data from the
+        service.
+        """
+
+        self._properties = {}
+        self._allowableActions = {}
 
     def reload(self, **kwargs):
 
@@ -47,7 +194,23 @@ class CmisObject(object):
         '*'.
         """
 
-        pass
+        if self._extArgs:
+            self._extArgs.update(kwargs)
+        else:
+            self._extArgs = kwargs
+
+        byObjectIdUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.getObjectId() + "&cmisselector=object"
+        self.data = self._cmisClient.binding.get(byObjectIdUrl.encode('utf-8'),
+                                                 self._cmisClient.username,
+                                                 self._cmisClient.password,
+                                                 **self._extArgs)
+        self._initData()
+
+        # if a returnVersion arg was passed in, it is possible we got back
+        # a different object ID than the value we started with, so it needs
+        # to be cleared out as well
+        if 'returnVersion' in self._extArgs.keys():
+            self._objectId = None
 
     def getObjectId(self):
 
@@ -59,7 +222,13 @@ class CmisObject(object):
         u'workspace://SpacesStore/dc26102b-e312-471b-b2af-91bfb0225339'
         """
 
-        pass
+        if self._objectId is None:
+            if self.data is None:
+                self.logger.debug('Both objectId and data were None, reloading')
+                self.reload()
+            props = self.getProperties()
+            self._objectId = CmisId(props['cmis:objectId'])
+        return self._objectId
 
     def getObjectParents(self, **kwargs):
         """
@@ -73,7 +242,16 @@ class CmisObject(object):
          - includeRelativePathSegment
         """
 
-        pass
+        if not self.getAllowableActions()['canGetObjectParents']:
+            raise NotSupportedException('Object does not support getObjectParents')
+
+        byObjectIdUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.getObjectId() + "&cmisselector=parents"
+        result = self._cmisClient.binding.get(byObjectIdUrl.encode('utf-8'),
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        # return the result set
+        return BrowserResultSet(self._cmisClient, self._repository, {'objects': result}, serializer=ChildrenSerializer())
 
     def getPaths(self):
         """
@@ -102,15 +280,13 @@ class CmisObject(object):
         canGetProperties:True
         """
 
-        pass
+        if self._allowableActions == {}:
+            self.reload(includeAllowableActions=True)
+            assert 'allowableActions' in self.data.keys(), "Expected object data to have an allowableActions key"
+            allowableActions = self.data['allowableActions']
+            self._allowableActions = allowableActions
 
-    def getTitle(self):
-
-        """
-        Returns the value of the object's cmis:title property.
-        """
-
-        pass
+        return self._allowableActions
 
     def getProperties(self):
 
@@ -134,7 +310,13 @@ class CmisObject(object):
         The optional filter argument is not yet implemented.
         """
 
-        pass
+        if self._properties == {}:
+            if self.data is None:
+                self.reload()
+            for prop in self.data['properties'].itervalues():
+                self._properties[prop['id']] = parsePropValueByType(prop['value'], prop['type'])
+
+        return self._properties
 
     def getName(self):
 
@@ -147,7 +329,7 @@ class CmisObject(object):
         u'system-overview.html'
         """
 
-        pass
+        return self.getProperties()['cmis:name']
 
     def updateProperties(self, properties):
 
@@ -166,7 +348,27 @@ class CmisObject(object):
 
         """
 
-        pass
+        # get the root folder URL
+        updateUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.id
+
+        props = {"cmisaction": "update"}
+
+        propCount = 0
+        for prop in properties:
+            props["propertyId[%s]" % propCount] = prop
+            props["propertyValue[%s]" % propCount] = properties[prop]
+            propCount += 1
+
+        # invoke the URL
+        result = self._cmisClient.binding.post(updateUrl.encode('utf-8'),
+                                               urlencode(props),
+                                               'application/x-www-form-urlencoded',
+                                               self._cmisClient.username,
+                                               self._cmisClient.password)
+
+        self.data = result
+        self._initData()
+        return self
 
     def move(self, sourceFolder, targetFolder):
 
@@ -179,7 +381,21 @@ class CmisObject(object):
         >>> doc.move(sub1, sub2)
         """
 
-        pass
+        moveUrl = self._repository.getRootFolderUrl()
+
+        props = {"objectId": self.id,
+                 "cmisaction": "move",
+                 "sourceFolderId": sourceFolder.id,
+                 "targetFolderId": targetFolder.id}
+
+        # invoke the URL
+        self._cmisClient.binding.post(moveUrl.encode('utf-8'),
+                                      urlencode(props),
+                                      'application/x-www-form-urlencoded',
+                                      self._cmisClient.username,
+                                      self._cmisClient.password)
+
+        return
 
     def delete(self, **kwargs):
 
@@ -195,7 +411,20 @@ class CmisObject(object):
         The optional allVersions argument is supported.
         """
 
-        pass
+        delUrl = self._repository.getRootFolderUrl()
+
+        props = {"objectId": self.id,
+                 "cmisaction": "delete"}
+
+        # invoke the URL
+        self._cmisClient.binding.post(delUrl.encode('utf-8'),
+                                      urlencode(props),
+                                      'application/x-www-form-urlencoded',
+                                      self._cmisClient.username,
+                                      self._cmisClient.password,
+                                      **kwargs)
+
+        return
 
     def applyPolicy(self, policyId):
 
@@ -273,7 +502,16 @@ class CmisObject(object):
         The optional onlyBasicPermissions argument is currently not supported.
         """
 
-        pass
+        if self._repository.getCapabilities()['ACL']:
+            # if the ACL capability is discover or manage, this must be
+            # supported
+            aclUrl = self._repository.getRootFolderUrl() + "?cmisselector=object&objectId=" + self.getObjectId() + "&includeACL=true"
+            result = self._cmisClient.binding.get(aclUrl.encode('utf-8'),
+                                                  self._cmisClient.username,
+                                                  self._cmisClient.password)
+            return BrowserACL(data=result['acl'])
+        else:
+            raise NotSupportedException
 
     def applyACL(self, acl):
 
@@ -287,18 +525,40 @@ class CmisObject(object):
         >>> acl.getEntries()
         {u'GROUP_EVERYONE': <cmislib.model.ACE object at 0x10071a8d0>, 'jdoe': <cmislib.model.ACE object at 0x10071a590>}
         """
+        if self._repository.getCapabilities()['ACL'] == 'manage':
+            # if the ACL capability is manage, this must be
+            # supported
+            # but it also depends on the canApplyACL allowable action
+            # for this object
+            if not isinstance(acl, ACL):
+                raise CmisException('The ACL to apply must be an instance of the ACL class.')
+            # get the root folder URL
+            aclUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.id + "&cmisaction=applyACL"
 
-        pass
+            aclJSON = ACLSerializer().toJSON(acl)
+
+            contentType, body = encode_multipart_formdata(None, StringIO.StringIO(aclJSON), 'application/json')
+
+            # invoke the URL
+            result = self._cmisClient.binding.post(aclUrl.encode('utf-8'),
+                                                   body,
+                                                   contentType,
+                                                   self._cmisClient.username,
+                                                   self._cmisClient.password)
+
+            # return the result set
+            return BrowserACL(data=result)
+        else:
+            raise NotSupportedException
 
     allowableActions = property(getAllowableActions)
     name = property(getName)
     id = property(getObjectId)
     properties = property(getProperties)
-    title = property(getTitle)
     ACL = property(getACL)
 
 
-class Repository(object):
+class BrowserRepository(object):
     """
     Represents a CMIS repository. Will lazily populate itself by
     calling the repository CMIS service URL.
@@ -307,10 +567,10 @@ class Repository(object):
     instance of this class.
     """
 
-    def __init__(self, cmisClient, xmlDoc=None):
+    def __init__(self, cmisClient, data=None):
         """ Constructor """
         self._cmisClient = cmisClient
-        self.xmlDoc = xmlDoc
+        self.data = data
         self._repositoryId = None
         self._repositoryName = None
         self._repositoryInfo = {}
@@ -319,7 +579,7 @@ class Repository(object):
         self._permMap = {}
         self._permissions = None
         self._propagation = None
-        self.logger = logging.getLogger('cmislib.model.Repository')
+        self.logger = logging.getLogger('cmislib.browser.binding.BrowserRepository')
         self.logger.info('Creating an instance of Repository')
 
     def __str__(self):
@@ -335,7 +595,6 @@ class Repository(object):
         self._repositoryName = None
         self._repositoryInfo = {}
         self._capabilities = {}
-        self._uriTemplates = {}
         self._permDefs = {}
         self._permMap = {}
         self._permissions = None
@@ -359,7 +618,11 @@ class Repository(object):
         u'83beb297-a6fa-4ac5-844b-98c871c0eea9'
         """
 
-        pass
+        if self._repositoryId is None:
+            if self.data is None:
+                self.reload()
+            self._repositoryId = self.data['repositoryId']
+        return self._repositoryId
 
     def getRepositoryName(self):
 
@@ -371,7 +634,11 @@ class Repository(object):
         u'Main Repository'
         """
 
-        pass
+        if self._repositoryName is None:
+            if self.data is None:
+                self.reload()
+            self._repositoryName = self.data['repositoryName']
+        return self._repositoryName
 
     def getRepositoryInfo(self):
 
@@ -395,7 +662,41 @@ class Repository(object):
         productName:Alfresco Repository (Community)
         """
 
-        pass
+        if not self._repositoryInfo:
+            if self.data is None:
+                self.reload()
+            repoInfo = {'repositoryId': self.data['repositoryId'], 'repositoryName': self.data['repositoryName'],
+                        'repositoryDescription': self.data['repositoryDescription'],
+                        'vendorName': self.data['vendorName'], 'productName': self.data['productName'],
+                        'productVersion': self.data['productVersion'], 'rootFolderId': self.data['rootFolderId'],
+                        'latestChangeLogToken': self.data['latestChangeLogToken'],
+                        'cmisVersionSupported': self.data['cmisVersionSupported'],
+                        'changesIncomplete': self.data['changesIncomplete'],
+                        'changesOnType': self.data['changesOnType'],
+                        'principalIdAnonymous': self.data['principalIdAnonymous'],
+                        'principalIdAnyone': self.data['principalIdAnyone']}
+            if 'thinClientURI' in self.data.keys():
+                repoInfo['thinClientURI'] = self.data['thinClientURI']
+            if 'extendedFeatures' in self.data.keys():
+                repoInfo['extendedFeatures'] = self.data['extendedFeatures']
+            self._repositoryInfo = repoInfo
+        return self._repositoryInfo
+
+    def getRootFolderUrl(self):
+
+        """ Gets the repository's root folder URL """
+
+        if self.data is None:
+            self.reload()
+        return self.data['rootFolderUrl']
+
+    def getRepositoryUrl(self):
+
+        """ Gets the repository's URL """
+
+        if self.data is None:
+            self.reload()
+        return self.data['repositoryUrl']
 
     def getObjectByPath(self, path, **kwargs):
 
@@ -411,7 +712,12 @@ class Repository(object):
          - includeAllowableActions
         """
 
-        pass
+        byPathUrl = self.getRootFolderUrl() + quote(path) + "?cmisselector=object"
+        result = self._cmisClient.binding.get(byPathUrl.encode('utf-8'),
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        return getSpecializedObject(BrowserCmisObject(self._cmisClient, self, data=result, **kwargs), **kwargs)
 
     def getSupportedPermissions(self):
         """
@@ -426,7 +732,16 @@ class Repository(object):
         u'both'
         """
 
-        pass
+        if not self.getCapabilities()['ACL']:
+            raise NotSupportedException(messages.NO_ACL_SUPPORT)
+
+        if not self._permissions:
+            if self.data is None:
+                self.reload()
+            if 'aclCapabilities' in self.data.keys():
+                if 'supportedPermissions' in self.data['aclCapabilities'].keys():
+                    self._permissions = self.data['aclCapabilities']['supportedPermissions']
+        return self._permissions
 
     def getPermissionDefinitions(self):
 
@@ -452,8 +767,15 @@ class Repository(object):
         cmis:read
         cmis:write
         """
+        if not self.getCapabilities()['ACL']:
+            raise NotSupportedException(messages.NO_ACL_SUPPORT)
 
-        pass
+        permData = self.data['aclCapabilities']['permissions']
+        perms = {}
+        for entry in permData:
+            perms[entry['permission']] = entry['description']
+
+        return perms
 
     def getPermissionMap(self):
 
@@ -480,8 +802,15 @@ class Repository(object):
         cmis:all
         {http://www.alfresco.org/model/content/1.0}lockable.CheckIn
         """
+        if not self.getCapabilities()['ACL']:
+            raise NotSupportedException(messages.NO_ACL_SUPPORT)
 
-        pass
+        permData = self.data['aclCapabilities']['permissionMapping']
+        permMap = {}
+        for entry in permData:
+            permMap[entry['key']] = entry['permission']
+
+        return permMap
 
     def getPropagation(self):
 
@@ -495,8 +824,10 @@ class Repository(object):
         >>> repo.propagation
         u'propagate'
         """
+        if not self.getCapabilities()['ACL']:
+            raise NotSupportedException(messages.NO_ACL_SUPPORT)
 
-        pass
+        return self.data['aclCapabilities']['propagation']
 
     def getCapabilities(self):
 
@@ -523,7 +854,16 @@ class Repository(object):
         Changes:None
         """
 
-        pass
+        if not self._capabilities:
+            if self.data is None:
+                self.reload()
+            caps = {}
+            if 'capabilities' in self.data.keys():
+                for cap in self.data['capabilities'].keys():
+                    key = cap.replace('capability', '')
+                    caps[key] = self.data['capabilities'][cap]
+                self._capabilities = caps
+        return self._capabilities
 
     def getRootFolder(self):
         """
@@ -534,7 +874,12 @@ class Repository(object):
         u'workspace://SpacesStore/aa1ecedf-9551-49c5-831a-0502bb43f348'
         """
 
-        pass
+        # get the root folder id
+        rootFolderId = self.getRepositoryInfo()['rootFolderId']
+        # instantiate a Folder object using the ID
+        folder = BrowserFolder(self._cmisClient, self, rootFolderId)
+        # return it
+        return folder
 
     def getFolder(self, folderId):
 
@@ -546,10 +891,12 @@ class Repository(object):
         u'workspace://SpacesStore/aa1ecedf-9551-49c5-831a-0502bb43f348'
         """
 
-        pass
+        retObject = self.getObject(folderId)
+        return BrowserFolder(self._cmisClient, self, data=retObject.data)
 
     def getTypeChildren(self,
-                        typeId=None):
+                        typeId=None,
+                        **kwargs):
 
         """
         Returns a list of :class:`ObjectType` objects corresponding to the
@@ -573,10 +920,25 @@ class Repository(object):
         cmis:policy
         """
 
-        pass
+        typesUrl = self.getRepositoryUrl() + "?cmisselector=typeChildren"
 
-    def getTypeDescendants(self, typeId=None, **kwargs):
+        if typeId is not None:
+            typesUrl += "&typeId=%s" % (quote(typeId))
 
+        result = self._cmisClient.binding.get(typesUrl,
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        types = []
+        for res in result['types']:
+            objectType = BrowserObjectType(self._cmisClient,
+                                           self,
+                                           data=res)
+            types.append(objectType)
+        # return the result
+        return types
+
+    def getTypeDescendants(self, typeId=None, depth=None, **kwargs):
         """
         Returns a list of :class:`ObjectType` objects corresponding to the
         descendant types of the type specified by the typeId.
@@ -601,22 +963,37 @@ class Repository(object):
         F:app:glossary
         F:fm:topic
 
-        These optional arguments are supported:
+        This optional argument is supported:
          - depth
+
+        These optional arguments are supported:
          - includePropertyDefinitions
 
-        >>> types = repo.getTypeDescendants('cmis:folder')
+        >>> types = alfRepo.getTypeDescendants('cmis:folder')
         >>> len(types)
         17
-        >>> types = repo.getTypeDescendants('cmis:folder', depth=1)
+        >>> types = alfRepo.getTypeDescendants('cmis:folder', depth=1)
         >>> len(types)
         12
-        >>> types = repo.getTypeDescendants('cmis:folder', depth=2)
+        >>> types = alfRepo.getTypeDescendants('cmis:folder', depth=2)
         >>> len(types)
         17
         """
 
-        pass
+        typesUrl = self.getRepositoryUrl() + "?cmisselector=typeDescendants"
+
+        if typeId is not None:
+            typesUrl += "&typeId=%s" % (quote(typeId))
+        if depth is not None:
+            typesUrl += "&depth=%s" % (depth)
+
+        result = self._cmisClient.binding.get(typesUrl,
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        serializer = TreeSerializer(treeType='type')
+        types = serializer.getEntries(self._cmisClient, self, result)
+        return types
 
     def getTypeDefinitions(self, **kwargs):
 
@@ -634,7 +1011,20 @@ class Repository(object):
         cmis:policy
         """
 
-        pass
+        typesUrl = self.getRepositoryUrl() + "?cmisselector=typeChildren"
+
+        result = self._cmisClient.binding.get(typesUrl,
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        types = []
+        for res in result['types']:
+            objectType = BrowserObjectType(self._cmisClient,
+                                           self,
+                                           data=res)
+            types.append(objectType)
+        # return the result
+        return types
 
     def getTypeDefinition(self, typeId):
 
@@ -643,16 +1033,16 @@ class Repository(object):
 
         >>> folderType = repo.getTypeDefinition('cmis:folder')
         """
+        # localhost:8080/chemistry/browser/A1?cmisselector=typeDefinition&typeId=cmis:folder
+        typesUrl = self.getRepositoryUrl() + "?cmisselector=typeDefinition" + \
+            "&typeId=" + typeId
+        result = self._cmisClient.binding.get(typesUrl,
+                                              self._cmisClient.username,
+                                              self._cmisClient.password)
 
-        pass
-
-    def getLink(self, rel):
-        """
-        Returns the HREF attribute of an Atom link element for the
-        specified rel.
-        """
-
-        pass
+        return BrowserObjectType(self._cmisClient,
+                                 self,
+                                 data=result)
 
     def getCheckedOutDocs(self, **kwargs):
 
@@ -680,7 +1070,16 @@ class Repository(object):
          - includeAllowableActions
         """
 
-        pass
+        typesUrl = self.getRepositoryUrl() + "?cmisselector=checkedOut"
+
+        result = self._cmisClient.binding.get(typesUrl,
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+
+        return BrowserResultSet(self._cmisClient,
+                                self,
+                                data=result)
 
     def getUnfiledDocs(self, **kwargs):
 
@@ -731,7 +1130,7 @@ class Repository(object):
          - includeAllowableActions
         """
 
-        pass
+        return getSpecializedObject(BrowserCmisObject(self._cmisClient, self, CmisId(objectId), **kwargs), **kwargs)
 
     def query(self, statement, **kwargs):
 
@@ -776,7 +1175,19 @@ class Repository(object):
         True
         """
 
-        pass
+        # build the CMIS query XML that we're going to POST
+        queryUrl = self.getRepositoryUrl() + "?cmisaction=query&q=" + quote(statement)
+
+        # do the POST
+        result = self._cmisClient.binding.post(queryUrl.encode('utf-8'),
+                                               None,
+                                               CMIS_FORM_TYPE,
+                                               self._cmisClient.username,
+                                               self._cmisClient.password,
+                                               **kwargs)
+
+        # return the result set
+        return BrowserResultSet(self._cmisClient, self, result, serializer=ResultsSerializer())
 
     def getContentChanges(self, **kwargs):
 
@@ -846,7 +1257,19 @@ class Repository(object):
         <cmislib.model.Document object at 0x101352ed0>
         """
 
-        pass
+        # if you didn't pass in a parent folder
+        if parentFolder is None:
+            # if the repository doesn't require fileable objects to be filed
+            if self.getCapabilities()['Unfiling']:
+                # has not been implemented
+                # postUrl = self.getCollectionLink(UNFILED_COLL)
+                raise NotImplementedError
+            else:
+                # this repo requires fileable objects to be filed
+                raise InvalidArgumentException
+
+        return parentFolder.createDocument(name, properties, StringIO.StringIO(contentString),
+                                           contentType, contentEncoding)
 
     def createDocument(self,
                        name,
@@ -880,7 +1303,47 @@ class Repository(object):
          - removeACEs
         """
 
-        pass
+        # if you didn't pass in a parent folder
+        if parentFolder is None:
+            # if the repository doesn't require fileable objects to be filed
+            if self.getCapabilities()['Unfiling']:
+                # has not been implemented
+                raise NotImplementedError
+            else:
+                # this repo requires fileable objects to be filed
+                raise InvalidArgumentException
+
+        # get the root folder URL
+        createDocUrl = self.getRootFolderUrl()
+
+        props = {"objectId": parentFolder.id,
+                 "cmisaction": "createDocument",
+                 "propertyId[0]": "cmis:name",
+                 "propertyValue[0]": name}
+
+        props["propertyId[1]"] = "cmis:objectTypeId"
+        if 'cmis:objectTypeId' in properties.keys():
+            props["propertyValue[1]"] = properties['cmis:objectTypeId']
+        else:
+            props["propertyValue[1]"] = "cmis:document"
+
+        propCount = 2
+        for prop in properties:
+            props["propertyId[%s]" % propCount] = prop
+            props["propertyValue[%s]" % propCount] = properties[prop]
+            propCount += 1
+
+        contentType, body = encode_multipart_formdata(props, contentFile, contentType)
+
+        # invoke the URL
+        result = self._cmisClient.binding.post(createDocUrl.encode('utf-8'),
+                                               body,
+                                               contentType,
+                                               self._cmisClient.username,
+                                               self._cmisClient.password)
+
+        # return the result set
+        return BrowserDocument(self._cmisClient, self, data=result)
 
     def createDocumentFromSource(self,
                                  sourceId,
@@ -901,7 +1364,8 @@ class Repository(object):
     def createFolder(self,
                      parentFolder,
                      name,
-                     properties={}):
+                     properties={},
+                     **kwargs):
 
         """
         Creates a new :class:`Folder` object in the specified parentFolder.
@@ -919,7 +1383,7 @@ class Repository(object):
          - removeACEs
         """
 
-        pass
+        return parentFolder.createFolder(name, properties, **kwargs)
 
     def createRelationship(self, sourceObj, targetObj, relType):
         """
@@ -947,35 +1411,6 @@ class Repository(object):
 
         pass
 
-    def getCollection(self, collectionType, **kwargs):
-
-        """
-        Returns a list of objects returned for the specified collection.
-
-        If the query collection is requested, an exception will be raised.
-        That collection isn't meant to be retrieved.
-
-        If the types collection is specified, the method returns the result of
-        `getTypeDefinitions` and ignores any optional params passed in.
-
-        >>> from cmislib.atompub.atompub_binding import TYPES_COLL
-        >>> types = repo.getCollection(TYPES_COLL)
-        >>> len(types)
-        4
-        >>> types[0].getTypeId()
-        u'cmis:folder'
-
-        Otherwise, the collection URL is invoked, and a :class:`ResultSet` is
-        returned.
-
-        >>> from cmislib.atompub.atompub_binding import CHECKED_OUT_COLL
-        >>> resultSet = repo.getCollection(CHECKED_OUT_COLL)
-        >>> len(resultSet.getResults())
-        1
-        """
-
-        pass
-
     capabilities = property(getCapabilities)
     id = property(getRepositoryId)
     info = property(getRepositoryInfo)
@@ -987,11 +1422,21 @@ class Repository(object):
     supportedPermissions = property(getSupportedPermissions)
 
 
-class ResultSet(object):
+class BrowserResultSet(object):
 
     """
-    Represents a paged result set. In CMIS, this is most often an Atom feed.
+    Represents a paged result set.
     """
+
+    def __init__(self, cmisClient, repository, data, serializer=None):
+        """ Constructor """
+        self._cmisClient = cmisClient
+        self._repository = repository
+        self._data = data
+        self._serializer = serializer
+        self._results = []
+        self.logger = logging.getLogger('cmislib.browser.binding.BrowserResultSet')
+        self.logger.info('Creating an instance of ResultSet')
 
     def __iter__(self):
         """ Iterator for the result set """
@@ -1010,6 +1455,7 @@ class ResultSet(object):
         """
         Re-invokes the self link for the current set of results.
 
+        >>> resultSet = repo.getCollection(CHECKED_OUT_COLL)
         >>> resultSet.reload()
 
         """
@@ -1030,7 +1476,13 @@ class ResultSet(object):
         <cmislib.model.Document object at 0x104851810>
         """
 
-        pass
+        if self._results:
+            return self._results
+
+        if self._data:
+            self._results = self._serializer.fromJSON(self._cmisClient, self._repository, self._data)
+
+        return self._results
 
     def hasObject(self, objectId):
 
@@ -1039,7 +1491,10 @@ class ResultSet(object):
         otherwise returns False.
         """
 
-        pass
+        for obj in self.getResults():
+            if obj.id == objectId:
+                return True
+        return False
 
     def getFirst(self):
 
@@ -1119,7 +1574,19 @@ class ResultSet(object):
         True
         """
 
-        pass
+        if self._data and 'hasMoreItems' in self._data:
+            return self._data['hasMoreItems']
+
+    def getNumItems(self):
+
+        """
+        Returns the number of items in the result set.
+        >>> resultSet.getNumItems()
+        3
+        """
+
+        if self._data:
+            return self._data['numItems']
 
     def hasPrev(self):
 
@@ -1158,7 +1625,7 @@ class ResultSet(object):
         pass
 
 
-class Document(CmisObject):
+class BrowserDocument(BrowserCmisObject):
 
     """
     An object typically associated with file content.
@@ -1180,7 +1647,19 @@ class Document(CmisObject):
         True
         """
 
-        pass
+        coUrl = self._repository.getRootFolderUrl()
+
+        props = {"objectId": self.id,
+                 "cmisaction": "checkOut"}
+
+        # invoke the URL
+        result = self._cmisClient.binding.post(coUrl.encode('utf-8'),
+                                               urlencode(props),
+                                               'application/x-www-form-urlencoded',
+                                               self._cmisClient.username,
+                                               self._cmisClient.password)
+
+        return getSpecializedObject(BrowserCmisObject(self._cmisClient, self._repository, data=result))
 
     def cancelCheckout(self):
         """
@@ -1195,7 +1674,19 @@ class Document(CmisObject):
         False
         """
 
-        pass
+        coUrl = self._repository.getRootFolderUrl()
+
+        props = {"objectId": self.id,
+                 "cmisaction": "cancelCheckOut"}
+
+        # invoke the URL
+        self._cmisClient.binding.post(coUrl.encode('utf-8'),
+                                      urlencode(props),
+                                      'application/x-www-form-urlencoded',
+                                      self._cmisClient.username,
+                                      self._cmisClient.password)
+
+        return
 
     def getPrivateWorkingCopy(self):
 
@@ -1213,7 +1704,12 @@ class Document(CmisObject):
         u'sample-b (Working Copy).pdf'
         """
 
-        pass
+        # reloading the document just to make sure we've got the latest
+        # and greatest PWC ID
+        self.reload()
+        pwcDocId = self.getProperties()['cmis:versionSeriesCheckedOutId']
+        if pwcDocId:
+            return self._repository.getObject(pwcDocId)
 
     def isCheckedOut(self):
 
@@ -1227,7 +1723,10 @@ class Document(CmisObject):
         False
         """
 
-        pass
+        # reloading the document just to make sure we've got the latest
+        # and greatest checked out prop
+        self.reload()
+        return self.getProperties()['cmis:isVersionSeriesCheckedOut']
 
     def getCheckedOutBy(self):
 
@@ -1238,7 +1737,10 @@ class Document(CmisObject):
         u'admin'
         """
 
-        pass
+        # reloading the document just to make sure we've got the latest
+        # and greatest checked out prop
+        self.reload()
+        return self.getProperties()['cmis:versionSeriesCheckedOutBy']
 
     def checkin(self, checkinComment=None, **kwargs):
 
@@ -1256,7 +1758,7 @@ class Document(CmisObject):
         >>> doc.isCheckedOut()
         False
 
-        The following optional arguments are supported:
+        The following optional arguments are NOT supported:
          - major
          - properties
          - contentStream
@@ -1264,8 +1766,28 @@ class Document(CmisObject):
          - addACEs
          - removeACEs
         """
+        # TODO implement optional arguments
+        # major = true is supposed to be the default but inmemory 0.9 is throwing an error 500 without it
+        if 'major' not in kwargs.keys():
+            kwargs['major'] = 'true'
 
-        pass
+        kwargs['checkinComment'] = checkinComment
+
+        ciUrl = self._repository.getRootFolderUrl()
+
+        # TODO don't hardcode major flag
+        props = {"objectId": self.id,
+                 "cmisaction": "checkIn"}
+
+        # invoke the URL
+        result = self._cmisClient.binding.post(ciUrl.encode('utf-8'),
+                                               urlencode(props),
+                                               'application/x-www-form-urlencoded',
+                                               self._cmisClient.username,
+                                               self._cmisClient.password,
+                                               **kwargs)
+
+        return getSpecializedObject(BrowserCmisObject(self._cmisClient, self._repository, data=result))
 
     def getLatestVersion(self, **kwargs):
 
@@ -1293,7 +1815,13 @@ class Document(CmisObject):
         u'2.0'
         """
 
-        pass
+        doc = None
+        if 'makir' in kwargs.keys() and kwargs['major'] == 'true':
+            doc = self._repository.getObject(self.getObjectId(), returnVersion='latestmajor')
+        else:
+            doc = self._repository.getObject(self.getObjectId(), returnVersion='latest')
+
+        return doc
 
     def getPropertiesOfLatestVersion(self, **kwargs):
 
@@ -1304,7 +1832,9 @@ class Document(CmisObject):
         The optional major and filter arguments are supported.
         """
 
-        pass
+        latestDoc = self.getLatestVersion(**kwargs)
+
+        return latestDoc.getProperties()
 
     def getAllVersions(self, **kwargs):
 
@@ -1316,7 +1846,17 @@ class Document(CmisObject):
         supported.
         """
 
-        pass
+        # get the version history link
+        versionsUrl = self._repository.getRootFolderUrl() + '?cmisselector=versions' + '&objectId=' + self.getObjectId()
+
+        # invoke the URL
+        result = self._cmisClient.binding.get(versionsUrl.encode('utf-8'),
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+
+        # return the result set
+        return BrowserResultSet(self._cmisClient, self._repository, data={'objects': result}, serializer=VersionsSerializer())
 
     def getContentStream(self):
 
@@ -1337,7 +1877,17 @@ class Document(CmisObject):
         The optional streamId argument is not yet supported.
         """
 
-        pass
+        if not self.getAllowableActions()['canGetContentStream']:
+            return None
+
+        contentUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.getObjectId() + "&selector=content"
+        result, content = Rest().get(contentUrl.encode('utf-8'),
+                                     self._cmisClient.username,
+                                     self._cmisClient.password,
+                                     **self._cmisClient.extArgs)
+        if result['status'] != '200':
+            raise CmisException(result['status'])
+        return StringIO.StringIO(content)
 
     def setContentStream(self, contentFile, contentType=None):
 
@@ -1348,7 +1898,20 @@ class Document(CmisObject):
          - overwriteFlag=None
         """
 
-        pass
+        # get the root folder URL
+        createDocUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.id + "&cmisaction=setContent"
+
+        contentType, body = encode_multipart_formdata(None, contentFile, contentType)
+
+        # invoke the URL
+        result = self._cmisClient.binding.post(createDocUrl.encode('utf-8'),
+                                               body,
+                                               contentType,
+                                               self._cmisClient.username,
+                                               self._cmisClient.password)
+
+        # return the result set
+        return BrowserDocument(self._cmisClient, self, data=result)
 
     def deleteContentStream(self):
 
@@ -1356,7 +1919,25 @@ class Document(CmisObject):
         Delete's the content stream associated with this object.
         """
 
-        pass
+        if not self.allowableActions['canDeleteContentStream']:
+            raise CmisException('Not allowed to delete the content stream')
+
+        delUrl = self._repository.getRootFolderUrl()
+
+        props = {"objectId": self.id,
+                 "cmisaction": "deleteContent"}
+
+        if 'cmis:changeToken' in self.properties.keys():
+            props["changeToken"] = self.properties['cmis:changeToken']
+
+        # invoke the URL
+        self._cmisClient.binding.post(delUrl.encode('utf-8'),
+                                      urlencode(props),
+                                      'application/x-www-form-urlencoded',
+                                      self._cmisClient.username,
+                                      self._cmisClient.password)
+
+        return
 
     def getRenditions(self):
 
@@ -1370,7 +1951,27 @@ class Document(CmisObject):
          - skipCount
         """
 
-        pass
+        # if Renditions capability is None, return notsupported
+        if self._repository.getCapabilities()['Renditions']:
+            pass
+        else:
+            raise NotSupportedException
+
+        renditions = []
+
+        contentUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.getObjectId() + "&cmisselector=renditions&renditionFilter=*"
+        result, content = Rest().get(contentUrl.encode('utf-8'),
+                                     self._cmisClient.username,
+                                     self._cmisClient.password,
+                                     **self._cmisClient.extArgs)
+        if result['status'] != '200':
+            raise CmisException(result['status'])
+
+        resultObj = json.loads(content)
+        for rendObj in resultObj:
+            renditions.append(BrowserRendition(rendObj))
+
+        return renditions
 
     checkedOut = property(isCheckedOut)
 
@@ -1381,16 +1982,32 @@ class Document(CmisObject):
         of cmis:path with the relativePathSegment.
         """
 
-        pass
+        byObjectIdUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.getObjectId() + "&cmisselector=parents&includerelativepathsegment=true"
+        result = self._cmisClient.binding.get(byObjectIdUrl.encode('utf-8'),
+                                              self._cmisClient.username,
+                                              self._cmisClient.password)
+
+        paths = []
+
+        for res in result:
+            path = res['object']['properties']['cmis:path']['value']
+            logging.debug(path)
+            relativePathSegment = res['relativePathSegment']
+
+            # concat with a slash
+            # add it to the list
+            paths.append(path + '/' + relativePathSegment)
+
+        return paths
 
 
-class Folder(CmisObject):
+class BrowserFolder(BrowserCmisObject):
 
     """
     A container object that can hold other :class:`CmisObject` objects
     """
 
-    def createFolder(self, name, properties={}):
+    def createFolder(self, name, properties={}, **kwargs):
 
         """
         Creates a new :class:`Folder` using the properties provided.
@@ -1414,7 +2031,36 @@ class Folder(CmisObject):
          - removeACEs
         """
 
-        pass
+        # get the root folder URL
+        createFolderUrl = self._repository.getRootFolderUrl()
+
+        props = {"objectId": self.id,
+                 "cmisaction": "createFolder",
+                 "propertyId[0]": "cmis:name",
+                 "propertyValue[0]": name}
+
+        props["propertyId[1]"] = "cmis:objectTypeId"
+        if 'cmis:objectTypeId' in properties.keys():
+            props["propertyValue[1]"] = properties['cmis:objectTypeId']
+        else:
+            props["propertyValue[1]"] = "cmis:folder"
+
+        propCount = 2
+        for prop in properties:
+            props["propertyId[%s]" % propCount] = prop.key
+            props["propertyValue[%s]" % propCount] = prop
+            propCount += 1
+
+        # invoke the URL
+        result = self._cmisClient.binding.post(createFolderUrl.encode('utf-8'),
+                                               urlencode(props),
+                                               'application/x-www-form-urlencoded',
+                                               self._cmisClient.username,
+                                               self._cmisClient.password,
+                                               **kwargs)
+
+        # return the result set
+        return BrowserFolder(self._cmisClient, self._repository, data=result)
 
     def createDocumentFromString(self,
                                  name,
@@ -1434,7 +2080,12 @@ class Folder(CmisObject):
         >>> testFolder.createDocumentFromString('testdoc3', contentString='hello, world', contentType='text/plain')
         """
 
-        pass
+        return self._repository.createDocumentFromString(name,
+                                                         properties,
+                                                         self,
+                                                         contentString,
+                                                         contentType,
+                                                         contentEncoding)
 
     def createDocument(self, name, properties={}, contentFile=None,
                        contentType=None, contentEncoding=None):
@@ -1477,7 +2128,12 @@ class Folder(CmisObject):
          - removeACEs
         """
 
-        pass
+        return self._repository.createDocument(name,
+                                               properties,
+                                               self,
+                                               contentFile,
+                                               contentType,
+                                               contentEncoding)
 
     def getChildren(self, **kwargs):
 
@@ -1502,7 +2158,13 @@ class Folder(CmisObject):
          - includePathSegment
         """
 
-        pass
+        byObjectIdUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.getObjectId() + "&cmisselector=children"
+        result = self._cmisClient.binding.get(byObjectIdUrl.encode('utf-8'),
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        # return the result set
+        return BrowserResultSet(self._cmisClient, self._repository, result, serializer=ChildrenSerializer())
 
     def getDescendants(self, **kwargs):
 
@@ -1536,7 +2198,13 @@ class Folder(CmisObject):
 
         """
 
-        pass
+        byObjectIdUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.getObjectId() + "&cmisselector=descendants"
+        result = self._cmisClient.binding.get(byObjectIdUrl.encode('utf-8'),
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        # return the result set
+        return BrowserResultSet(self._cmisClient, self._repository, result, serializer=TreeSerializer())
 
     def getTree(self, **kwargs):
 
@@ -1564,15 +2232,21 @@ class Folder(CmisObject):
          u'subfolder'
         """
 
-        pass
+        byObjectIdUrl = self._repository.getRootFolderUrl() + "?objectId=" + self.getObjectId() + "&cmisselector=foldertree"
+        result = self._cmisClient.binding.get(byObjectIdUrl.encode('utf-8'),
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        # return the result set
+        return BrowserResultSet(self._cmisClient, self._repository, result, serializer=TreeSerializer())
 
     def getParent(self):
 
         """
         The optional filter argument is not yet supported.
         """
-
-        pass
+        if 'cmis:parentId' in self.properties.keys() and self.properties['cmis:parentId'] is not None:
+            return BrowserFolder(self._cmisClient, self._repository, objectId=self.properties['cmis:parentId'])
 
     def deleteTree(self, **kwargs):
 
@@ -1590,7 +2264,20 @@ class Folder(CmisObject):
          - continueOnFailure
         """
 
-        pass
+        delUrl = self._repository.getRootFolderUrl()
+
+        props = {"objectId": self.id,
+                 "cmisaction": "deleteTree"}
+
+        # invoke the URL
+        self._cmisClient.binding.post(delUrl.encode('utf-8'),
+                                      urlencode(props),
+                                      'application/x-www-form-urlencoded',
+                                      self._cmisClient.username,
+                                      self._cmisClient.password,
+                                      **kwargs)
+
+        return
 
     def addObject(self, cmisObject, **kwargs):
 
@@ -1611,11 +2298,26 @@ class Folder(CmisObject):
         >>> sub2.getChildren()[0].name
         u'testdoc1'
 
-        The following optional arguments are supported:
+        The following optional arguments are NOT supported:
          - allVersions
         """
+        # TODO need to add support (and unit test) for allVersions
 
-        pass
+        addUrl = self._repository.getRootFolderUrl()
+
+        props = {"folderId": self.id,
+                 "cmisaction": "addObjectToFolder",
+                 "objectId": cmisObject.id}
+
+        # invoke the URL
+        result = self._cmisClient.binding.post(addUrl.encode('utf-8'),
+                                               urlencode(props),
+                                               'application/x-www-form-urlencoded',
+                                               self._cmisClient.username,
+                                               self._cmisClient.password,
+                                               **kwargs)
+
+        return getSpecializedObject(BrowserCmisObject(self._cmisClient, self._repository, data=result))
 
     def removeObject(self, cmisObject):
 
@@ -1624,7 +2326,20 @@ class Folder(CmisObject):
         support unfiling for this to work.
         """
 
-        pass
+        remUrl = self._repository.getRootFolderUrl()
+
+        props = {"folderId": self.id,
+                 "cmisaction": "removeObjectFromFolder",
+                 "objectId": cmisObject.id}
+
+        # invoke the URL
+        result = self._cmisClient.binding.post(remUrl.encode('utf-8'),
+                                               urlencode(props),
+                                               'application/x-www-form-urlencoded',
+                                               self._cmisClient.username,
+                                               self._cmisClient.password)
+
+        return getSpecializedObject(BrowserCmisObject(self._cmisClient, self._repository, data=result))
 
     def getPaths(self):
         """
@@ -1633,10 +2348,10 @@ class Folder(CmisObject):
         to be symmetric with the same method in :class:`Document`.
         """
 
-        pass
+        return [self.properties['cmis:path']]
 
 
-class Relationship(CmisObject):
+class BrowserRelationship(CmisObject):
 
     """
     Defines a relationship object between two :class:`CmisObjects` objects
@@ -1647,7 +2362,7 @@ class Relationship(CmisObject):
         """
         Returns the :class:`CmisId` on the source side of the relationship.
         """
-
+        # TODO need to implement
         pass
 
     def getTargetId(self):
@@ -1655,7 +2370,7 @@ class Relationship(CmisObject):
         """
         Returns the :class:`CmisId` on the target side of the relationship.
         """
-
+        # TODO need to implement
         pass
 
     def getSource(self):
@@ -1664,7 +2379,7 @@ class Relationship(CmisObject):
         Returns an instance of the appropriate child-type of :class:`CmisObject`
         for the source side of the relationship.
         """
-
+        # TODO need to implement
         pass
 
     def getTarget(self):
@@ -1673,7 +2388,7 @@ class Relationship(CmisObject):
         Returns an instance of the appropriate child-type of :class:`CmisObject`
         for the target side of the relationship.
         """
-
+        # TODO need to implement
         pass
 
     sourceId = property(getSourceId)
@@ -1682,7 +2397,7 @@ class Relationship(CmisObject):
     target = property(getTarget)
 
 
-class Policy(CmisObject):
+class BrowserPolicy(CmisObject):
 
     """
     An arbirary object that can 'applied' to objects that the
@@ -1692,12 +2407,26 @@ class Policy(CmisObject):
     pass
 
 
-class ObjectType(object):
+class BrowserObjectType(ObjectType):
 
     """
     Represents the CMIS object type such as 'cmis:document' or 'cmis:folder'.
     Contains metadata about the type.
     """
+
+    def __init__(self, cmisClient, repository, typeId=None, data=None):
+        """ Constructor """
+        self._cmisClient = cmisClient
+        self._repository = repository
+        self._extArgs = None
+        self._typeId = typeId
+        self.data = data
+        self.logger = logging.getLogger('cmislib.browser.binding.BrowserObjectType')
+        self.logger.info('Creating an instance of BrowserObjectType')
+
+    def __str__(self):
+        """To string"""
+        return self.getTypeId()
 
     def getTypeId(self):
 
@@ -1709,71 +2438,95 @@ class ObjectType(object):
         'cmis:document'
         """
 
-        pass
+        if self._typeId is None:
+            if self.data is None:
+                self.reload()
+            self._typeId = CmisId(self.data['id'])
+
+        return self._typeId
 
     def getLocalName(self):
         """Getter for cmis:localName"""
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['localName']
 
     def getLocalNamespace(self):
         """Getter for cmis:localNamespace"""
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['localNamespace']
 
     def getDisplayName(self):
         """Getter for cmis:displayName"""
-        pass
+
+        if self.data is None:
+            self.reload()
+        return self.data['displayName']
 
     def getQueryName(self):
         """Getter for cmis:queryName"""
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['queryName']
 
     def getDescription(self):
         """Getter for cmis:description"""
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['description']
 
     def getBaseId(self):
         """Getter for cmis:baseId"""
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['baseId']
 
     def isCreatable(self):
         """Getter for cmis:creatable"""
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['creatable']
 
     def isFileable(self):
         """Getter for cmis:fileable"""
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['fileable']
 
     def isQueryable(self):
         """Getter for cmis:queryable"""
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['queryable']
 
     def isFulltextIndexed(self):
         """Getter for cmis:fulltextIndexed"""
-        pass
+
+        if self.data is None:
+            self.reload()
+        return self.data['fulltextIndexed']
 
     def isIncludedInSupertypeQuery(self):
         """Getter for cmis:includedInSupertypeQuery"""
-        pass
+
+        if self.data is None:
+            self.reload()
+        return self.data['includedInSupertypeQuery']
 
     def isControllablePolicy(self):
         """Getter for cmis:controllablePolicy"""
-        pass
+
+        if self.data is None:
+            self.reload()
+        return self.data['controllablePolicy']
 
     def isControllableACL(self):
         """Getter for cmis:controllableACL"""
-        pass
 
-    def getLink(self, rel, linkType):
-
-        """
-        Gets the HREF for the link element with the specified rel and linkType.
-
-        >>> from cmislib.atompub.atompub_binding import ATOM_XML_FEED_TYPE
-        >>> docType.getLink('down', ATOM_XML_FEED_TYPE)
-        u'http://localhost:8080/alfresco/s/cmis/type/cmis:document/children'
-        """
-
-        pass
+        if self.data is None:
+            self.reload()
+        return self.data['controllableACL']
 
     def getProperties(self):
 
@@ -1799,13 +2552,29 @@ class ObjectType(object):
         ...    print 'Open choice:%s' % prop.openChoice
         """
 
-        pass
+        if self.data is None or 'propertyDefinitions' not in self.data.keys():
+            self.reload()
+        props = {}
+        for prop in self.data['propertyDefinitions'].keys():
+            props[prop] = BrowserProperty(self.data['propertyDefinitions'][prop])
+        return props
 
     def reload(self, **kwargs):
         """
         This method will reload the object's data from the CMIS service.
         """
-        pass
+        if kwargs:
+            if self._extArgs:
+                self._extArgs.update(kwargs)
+
+        typesUrl = self._repository.getRepositoryUrl()
+        kwargs['cmisselector'] = 'typeDefinition'
+        kwargs['typeId'] = self.getTypeId()
+        result = self._cmisClient.binding.get(typesUrl,
+                                              self._cmisClient.username,
+                                              self._cmisClient.password,
+                                              **kwargs)
+        self.data = result
 
     id = property(getTypeId)
     localName = property(getLocalName)
@@ -1824,68 +2593,78 @@ class ObjectType(object):
     properties = property(getProperties)
 
 
-class Property(object):
+class BrowserProperty(object):
 
     """
     This class represents an attribute or property definition of an object
     type.
     """
 
+    def __init__(self, data):
+        """Constructor"""
+        self.data = data
+        self.logger = logging.getLogger('cmislib.browser.binding.BrowserProperty')
+        self.logger.info('Creating an instance of BrowserProperty')
+
+    def __str__(self):
+        """To string"""
+        return self.getId()
+
     def getId(self):
         """Getter for cmis:id"""
-        pass
+        return self.data['id']
 
     def getLocalName(self):
         """Getter for cmis:localName"""
-        pass
+        return self.data['localName']
 
     def getLocalNamespace(self):
         """Getter for cmis:localNamespace"""
-        pass
+        return self.data['localNamespace']
 
     def getDisplayName(self):
         """Getter for cmis:displayName"""
-        pass
+        return self.data['displayName']
 
     def getQueryName(self):
         """Getter for cmis:queryName"""
-        pass
+        return self.data['queryName']
 
     def getDescription(self):
         """Getter for cmis:description"""
-        pass
+        return self.data['description']
 
     def getPropertyType(self):
         """Getter for cmis:propertyType"""
-        pass
+        return self.data['propertyType']
 
     def getCardinality(self):
         """Getter for cmis:cardinality"""
-        pass
+        return self.data['cardinality']
 
     def getUpdatability(self):
         """Getter for cmis:updatability"""
-        pass
+        return self.data['updatability']
 
     def isInherited(self):
         """Getter for cmis:inherited"""
-        pass
+        return self.data['inherited']
 
     def isRequired(self):
         """Getter for cmis:required"""
-        pass
+        return self.data['required']
 
     def isQueryable(self):
         """Getter for cmis:queryable"""
-        pass
+        return self.data['queryable']
 
     def isOrderable(self):
         """Getter for cmis:orderable"""
-        pass
+        return self.data['orderable']
 
     def isOpenChoice(self):
         """Getter for cmis:openChoice"""
-        pass
+        return self.data['openChoice']
 
     id = property(getId)
     localName = property(getLocalName)
@@ -1903,11 +2682,52 @@ class Property(object):
     openChoice = property(isOpenChoice)
 
 
-class ACL(object):
+class BrowserACL(ACL):
 
     """
     Represents the Access Control List for an object.
     """
+
+    def __init__(self, aceList=None, data=None):
+
+        """
+        Constructor. Pass in either a list of :class:`ACE` objects or the XML
+        representation of the ACL. If you have only one ACE, don't worry about
+        the list--the constructor will convert it to a list for you.
+        """
+
+        if aceList:
+            self._entries = aceList
+        else:
+            self._entries = {}
+        if data:
+            self._data = data
+            self._entries = self._getEntriesFromData()
+        else:
+            self._data = None
+
+        self.logger = logging.getLogger('cmislib.browser.binding.BrowserACL')
+        self.logger.info('Creating an instance of ACL')
+
+    def _getEntriesFromData(self):
+
+        """
+        Internal method used to get the ACL entries from the fetched data.
+        """
+
+        if not self._data:
+            return
+        result = {}
+        for entry in self._data['aces']:
+            principalId = entry['principal']['principalId']
+            direct = entry['isDirect']
+            perms = entry['permissions']
+            # create an ACE
+            if len(perms) > 0:
+                ace = BrowserACE(principalId, perms, direct)
+                # append it to the dictionary
+                result[principalId] = ace
+        return result
 
     def addEntry(self, principalId, access, direct):
 
@@ -1915,13 +2735,14 @@ class ACL(object):
         Adds an :class:`ACE` entry to the ACL.
 
         >>> acl = folder.getACL()
-        >>> acl.addEntry('jpotts', 'cmis:read', 'true')
-        >>> acl.addEntry('jsmith', 'cmis:write', 'true')
+        >>> acl.addEntry(ACE('jpotts', 'cmis:read', 'true'))
+        >>> acl.addEntry(ACE('jsmith', 'cmis:write', 'true'))
         >>> acl.getEntries()
         {u'GROUP_EVERYONE': <cmislib.model.ACE object at 0x100731410>, u'jdoe': <cmislib.model.ACE object at 0x100731150>, 'jpotts': <cmislib.model.ACE object at 0x1005a22d0>, 'jsmith': <cmislib.model.ACE object at 0x1005a2210>}
         """
 
-        pass
+        ace = BrowserACE(principalId, access, direct)
+        self._entries[ace.principalId] = ace
 
     def removeEntry(self, principalId):
 
@@ -1935,7 +2756,8 @@ class ACL(object):
         {u'GROUP_EVERYONE': <cmislib.model.ACE object at 0x100731410>, u'jdoe': <cmislib.model.ACE object at 0x100731150>, 'jpotts': <cmislib.model.ACE object at 0x1005a22d0>}
         """
 
-        pass
+        if principalId in self._entries.keys():
+            del self._entries[principalId]
 
     def clearEntries(self):
 
@@ -1955,7 +2777,8 @@ class ACL(object):
         >>> acl.getXmlDoc()
         """
 
-        pass
+        self._entries.clear()
+        self._data = None
 
     def getEntries(self):
 
@@ -1977,47 +2800,28 @@ class ACL(object):
         cmis:write
         """
 
-        pass
+        if self._entries:
+            return self._entries
+        else:
+            if self._data:
+                # parse data and build entry list
+                self._entries = self._getEntriesFromData()
+                # then return it
+                return self._entries
 
     entries = property(getEntries)
 
 
-class ACE(object):
+class BrowserACE(ACE):
 
     """
-    Represents an individual Access Control Entry.
+    Represents an ACE retrieved with the Browser Binding.
     """
 
-    def __init__(self, principalId=None, permissions=None, direct=None):
-        """Constructor"""
-        self._principalId = principalId
-        if permissions:
-            if isinstance(permissions, str):
-                self._permissions = [permissions]
-            else:
-                self._permissions = permissions
-        self._direct = direct
-
-        self.logger = logging.getLogger('cmislib.model.ACE')
-        self.logger.info('Creating an instance of ACE for %s' % principalId)
-
-    @property
-    def principalId(self):
-        """Getter for principalId"""
-        return self._principalId
-
-    @property
-    def direct(self):
-        """Getter for direct"""
-        return self._direct
-
-    @property
-    def permissions(self):
-        """Getter for permissions"""
-        return self._permissions
+    pass
 
 
-class ChangeEntry(object):
+class BrowserChangeEntry(ChangeEntry):
 
     """
     Represents a change log entry. Retrieve a list of change entries via
@@ -2046,12 +2850,14 @@ class ChangeEntry(object):
         """
         Returns the unique ID of the change entry.
         """
+        # TODO need to implement
         pass
 
     def getObjectId(self):
         """
         Returns the object ID of the object that changed.
         """
+        # TODO need to implement
         pass
 
     def getChangeType(self):
@@ -2065,6 +2871,7 @@ class ChangeEntry(object):
          - deleted
          - security
         """
+        # TODO need to implement
         pass
 
     def getACL(self):
@@ -2072,7 +2879,7 @@ class ChangeEntry(object):
         """
         Gets the :class:`ACL` object that is included with this Change Entry.
         """
-
+        # TODO need to implement
         pass
 
     def getChangeTime(self):
@@ -2080,7 +2887,7 @@ class ChangeEntry(object):
         """
         Returns a datetime object representing the time the change occurred.
         """
-
+        # TODO need to implement
         pass
 
     def getProperties(self):
@@ -2090,7 +2897,7 @@ class ChangeEntry(object):
         capabilities of the repository ("capabilityChanges") the list may not
         include the actual property values that changed.
         """
-
+        # TODO need to implement
         pass
 
     id = property(getId)
@@ -2100,7 +2907,7 @@ class ChangeEntry(object):
     properties = property(getProperties)
 
 
-class ChangeEntryResultSet(ResultSet):
+class BrowserChangeEntryResultSet(BrowserResultSet):
 
     """
     A specialized type of :class:`ResultSet` that knows how to instantiate
@@ -2137,15 +2944,21 @@ class ChangeEntryResultSet(ResultSet):
         """
         Overriding to make it work with a list instead of a dict.
         """
-
+        # TODO need to implement
         pass
 
 
-class Rendition(object):
+class BrowserRendition(object):
 
     """
     This class represents a Rendition.
     """
+
+    def __init__(self, data):
+        """Constructor"""
+        self.data = data
+        self.logger = logging.getLogger('cmislib.browser.binding.BrowserRendition')
+        self.logger.info('Creating an instance of Rendition')
 
     def __str__(self):
         """To string"""
@@ -2153,39 +2966,39 @@ class Rendition(object):
 
     def getStreamId(self):
         """Getter for the rendition's stream ID"""
-        pass
+        return self.data['streamId']
 
     def getMimeType(self):
         """Getter for the rendition's mime type"""
-        pass
+        return self.data['mimeType']
 
     def getLength(self):
         """Getter for the renditions's length"""
-        pass
+        return self.data['length']
 
     def getTitle(self):
         """Getter for the renditions's title"""
-        pass
+        return self.data['title']
 
     def getKind(self):
         """Getter for the renditions's kind"""
-        pass
+        return self.data['kind']
 
     def getHeight(self):
         """Getter for the renditions's height"""
-        pass
+        return self.data['height']
 
     def getWidth(self):
         """Getter for the renditions's width"""
-        pass
+        return self.data['width']
 
     def getHref(self):
         """Getter for the renditions's href"""
-        pass
+        return self.data['href']
 
     def getRenditionDocumentId(self):
         """Getter for the renditions's width"""
-        pass
+        return self.data['renditionDocumentId']
 
     streamId = property(getStreamId)
     mimeType = property(getMimeType)
@@ -2198,7 +3011,7 @@ class Rendition(object):
     renditionDocumentId = property(getRenditionDocumentId)
 
 
-class CmisId(str):
+class BrowserCmisId(str):
 
     """
     This is a marker class to be used for Strings that are used as CMIS ID's.
@@ -2208,3 +3021,199 @@ class CmisId(str):
     """
 
     pass
+
+
+def getSpecializedObject(obj, **kwargs):
+
+    """
+    Returns an instance of the appropriate :class:`CmisObject` class or one
+    of its child types depending on the specified baseType.
+    """
+
+    moduleLogger.debug('Inside getSpecializedObject')
+
+    if 'cmis:baseTypeId' in obj.getProperties():
+        baseType = obj.getProperties()['cmis:baseTypeId']
+        if baseType == 'cmis:folder':
+            return BrowserFolder(obj._cmisClient, obj._repository, obj.getObjectId(), obj.data, **kwargs)
+        if baseType == 'cmis:document':
+            return BrowserDocument(obj._cmisClient, obj._repository, obj.getObjectId(), obj.data, **kwargs)
+        if baseType == 'cmis:relationship':
+            return BrowserRelationship(obj._cmisClient, obj._repository, obj.getObjectId(), obj.data, **kwargs)
+        if baseType == 'cmis:policy':
+            return BrowserPolicy(obj._cmisClient, obj._repository, obj.getObjectId(), obj.data, **kwargs)
+
+    # if the base type ID wasn't found in the props (this can happen when
+    # someone runs a query that doesn't select * or doesn't individually
+    # specify baseTypeId) or if the type isn't one of the known base
+    # types, give the object back
+    return obj
+
+
+def encode_multipart_formdata(fields, contentFile, contentType):
+    """
+    fields is a sequence of (name, value) elements for regular form fields.
+    files is a sequence of (name, filename, value) elements for data to be uploaded as files
+    Return (content_type, body) ready for httplib.HTTP instance
+    """
+    boundary = 'aPacHeCheMIStrycMisLIb%s' % (int(time.time()))
+    crlf = '\r\n'
+    L = []
+    fileName = None
+    if fields:
+        for (key, value) in fields.iteritems():
+            if key == 'cmis:name':
+                fileName = value
+            L.append('--' + boundary)
+            L.append('Content-Disposition: form-data; name="%s"' % key)
+            L.append('Content-Type: text/plain; charset=utf-8')
+            L.append('')
+            L.append(value.encode('utf-8'))
+
+    if contentFile:
+        L.append('--' + boundary)
+        L.append('Content-Disposition: form-data; name="%s"; filename=%s' % ('content', fileName))
+        L.append('Content-Type: %s' % contentType)
+        L.append('Content-Transfer-Encoding: binary')
+        L.append('')
+        L.append(contentFile.read())
+
+    L.append('--' + boundary + '--')
+    L.append('')
+    body = crlf.join(L)
+    content_type = 'multipart/form-data; boundary=%s' % boundary
+    return content_type, body
+
+
+class ResultsSerializer(object):
+
+    """
+    Responsible for serializing :class:`BrowserResultSet` objects.
+    """
+
+    def fromJSON(self, client, repo, jsonObj):
+        """Transforms from JSON to the object."""
+        entries = []
+        for obj in jsonObj['results']:
+            cmisObject = getSpecializedObject(BrowserCmisObject(client,
+                                                                repo,
+                                                                data=obj))
+            entries.append(cmisObject)
+
+        return entries
+
+
+class ChildrenSerializer(object):
+
+    """
+    Responsible for serializing lists of children.
+    """
+
+    def fromJSON(self, client, repo, jsonObj):
+        """Transforms from JSON to the object."""
+        entries = []
+        for obj in jsonObj['objects']:
+            dataObj = obj['object']
+            cmisObject = getSpecializedObject(BrowserCmisObject(client,
+                                                                repo,
+                                                                data=dataObj))
+            entries.append(cmisObject)
+
+        return entries
+
+
+class VersionsSerializer(object):
+
+    """
+    Responsible for serializing a list of versions.
+    """
+
+    def fromJSON(self, client, repo, jsonObj):
+        """Transforms from JSON to the object."""
+        entries = []
+        for obj in jsonObj['objects']:
+            cmisObject = getSpecializedObject(BrowserCmisObject(client,
+                                                                repo,
+                                                                data=obj))
+            entries.append(cmisObject)
+
+        return entries
+
+
+# TODO Preserve tree hierarchy
+class TreeSerializer(object):
+
+    """
+    The AtomPubBinding may be returning descendants and trees as a flat list of results.
+    We should probably implement a Tree result set and return that here instead.
+    """
+
+    def __init__(self, treeType='object'):
+        self.treeType = treeType
+
+    def fromJSON(self, client, repo, jsonObj):
+        """Transforms from JSON to the object."""
+        entries = self.getEntries(client, repo, jsonObj)
+
+        return entries
+
+    def getEntries(self, client, repo, jsonObj):
+        '''obj is the list of items in the tree'''
+        entries = []
+        for obj in jsonObj:
+            if self.treeType == 'object':
+                dataObj = obj['object']['object']
+                cmisThing = getSpecializedObject(BrowserCmisObject(client,
+                                                                   repo,
+                                                                   data=dataObj))
+            elif self.treeType == 'type':
+                dataObj = obj['type']
+                cmisThing = BrowserObjectType(client, repo, data=dataObj)
+            else:
+                raise CmisException("Invalid tree type")
+
+            entries.append(cmisThing)
+            try:
+                dataObj = obj['children']
+                # if obj['object'].has_key('children'):
+                #    for child in obj['object']['children']:
+                childEntries = self.getEntries(client, repo, dataObj)
+                entries = entries + childEntries
+            except KeyError:
+                pass
+
+        return entries
+
+
+class FolderSerializer(object):
+
+    """
+    Responsible for serializing :class:`Folder` objects.
+    """
+
+    def fromJSON(self, client, repo, jsonString):
+        """Transforms the folder from JSON to an object."""
+        obj = json.loads(jsonString)
+        objectId = obj['succinctProperties']['cmis:objectId']
+        folder = BrowserFolder(client, repo, objectId, properties=obj['succinctProperties'])
+        return folder
+
+
+class ACLSerializer(object):
+
+    """
+    Responsible for serializing :class:`BrowserACL` objects.
+    """
+
+    def toJSON(self, acl):
+        """ Transforms the ACL to JSON. """
+        entries = acl.getEntries()
+        aces = []
+        for key in entries:
+            entryJSON = {}
+            entryJSON['isDirect'] = entries[key].direct
+            entryJSON['prinipcal'] = {'principalId': entries[key].principalId}
+            entryJSON['permissions'] = entries[key].permissions
+            aces.append(entryJSON)
+
+        return json.dumps(aces)

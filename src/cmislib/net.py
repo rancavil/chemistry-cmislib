@@ -16,13 +16,21 @@
 #      specific language governing permissions and limitations
 #      under the License.
 #
-'''
-Module that knows how to connect to the AtomPub Binding of a CMIS repo
-'''
+"""
+Module that takes care of network communications for cmislib. It does
+not know anything about CMIS or do anything special with regard to the
+response it receives.
+"""
 
-from urllib import urlencode
+import sys
+
+if sys.version_info >= (3,):
+     from urllib.parse import urlencode
+else:
+     from urllib import urlencode
 import logging
 import httplib2
+
 
 class RESTService(object):
 
@@ -47,8 +55,8 @@ class RESTService(object):
         if kwargs:
             if 'headers' in kwargs:
                 headers = kwargs['headers']
-                del(kwargs['headers'])
-                self.logger.debug('Headers passed in:%s' % headers)
+                del kwargs['headers']
+                self.logger.debug('Headers passed in:' + headers)
             if url.find('?') >= 0:
                 url = url + '&' + urlencode(kwargs)
             else:
@@ -70,8 +78,8 @@ class RESTService(object):
         if kwargs:
             if 'headers' in kwargs:
                 headers = kwargs['headers']
-                del(kwargs['headers'])
-                self.logger.debug('Headers passed in:%s' % headers)
+                del kwargs['headers']
+                self.logger.debug('Headers passed in:' + headers)
             if url.find('?') >= 0:
                 url = url + '&' + urlencode(kwargs)
             else:
@@ -103,8 +111,8 @@ class RESTService(object):
         if kwargs:
             if 'headers' in kwargs:
                 headers = kwargs['headers']
-                del(kwargs['headers'])
-                self.logger.debug('Headers passed in:%s' % headers)
+                del kwargs['headers']
+                self.logger.debug('Headers passed in:' + headers)
             if url.find('?') >= 0:
                 url = url + '&' + urlencode(kwargs)
             else:
@@ -115,7 +123,7 @@ class RESTService(object):
         h = httplib2.Http()
         h.add_credentials(username, password)
         headers['User-Agent'] = self.user_agent
-        if contentType != None:
+        if contentType is not None:
             headers['Content-Type'] = contentType
         return h.request(url, body=payload, method='PUT', headers=headers)
 
@@ -137,8 +145,8 @@ class RESTService(object):
         if kwargs:
             if 'headers' in kwargs:
                 headers = kwargs['headers']
-                del(kwargs['headers'])
-                self.logger.debug('Headers passed in:%s' % headers)
+                del kwargs['headers']
+                self.logger.debug('Headers passed in:' + headers)
             if url.find('?') >= 0:
                 url = url + '&' + urlencode(kwargs)
             else:
@@ -149,6 +157,6 @@ class RESTService(object):
         h = httplib2.Http()
         h.add_credentials(username, password)
         headers['User-Agent'] = self.user_agent
-        if contentType != None:
+        if contentType is not None:
             headers['Content-Type'] = contentType
         return h.request(url, body=payload, method='POST', headers=headers)

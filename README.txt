@@ -28,4 +28,3 @@ required Python version, etc.
 NOTES
 
 To works with Python 2.7 and 3, checkout to branch trunk
-
