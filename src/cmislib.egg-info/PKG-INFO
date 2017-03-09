@@ -33,6 +33,9 @@ Description: ABOUT
         directory. Please see the doc for dependencies, required CMIS version level,
         required Python version, etc.
         
+        NOTES
+        
+        To works with Python 2.7 and 3, checkout to branch trunk
         
 Platform: UNKNOWN
 Classifier: Development Status :: 4 - Beta
