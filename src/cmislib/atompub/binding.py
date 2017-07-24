@@ -1727,7 +1727,7 @@ class AtomPubRepository(object):
                 # this repo requires fileable objects to be filed
                 raise InvalidArgumentException
 
-        return parentFolder.createDocument(name, properties, StringIO.StringIO(contentString),
+        return parentFolder.createDocument(name, properties, StringIO.BytesIO(contentString),
                                            contentType, contentEncoding)
 
     def createDocument(self,
@@ -2522,7 +2522,7 @@ class AtomPubDocument(AtomPubCmisObject):
                                          **self._cmisClient.extArgs)
             if result['status'] != '200':
                 raise CmisException(result['status'])
-            return StringIO.StringIO(content)
+            return StringIO.BytesIO(content)
         else:
             # otherwise, try to return the value of the content element
             if contentElements[0].childNodes:
